@@ -1,0 +1,14 @@
+# Local state / temp produced at runtime
+*.bak
+*.tmp
+/tmp/
+node_modules/
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

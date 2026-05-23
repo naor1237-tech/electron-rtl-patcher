@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "comment": "Catalog of Electron apps the patcher knows how to locate on Windows. Add your own entries here — see README. 'type':'asar' apps ship a packed resources/app.asar (extract/inject/repack). 'type':'dir' apps ship an unpacked resources/app/ folder (inject in place).",
+  "apps": [
+    {
+      "id": "claude",
+      "name": "Claude Desktop",
+      "type": "asar",
+      "bases": [
+        "%LOCALAPPDATA%\\AnthropicClaude",
+        "%LOCALAPPDATA%\\Programs\\claude",
+        "%LOCALAPPDATA%\\Programs\\Claude"
+      ],
+      "target": "resources\\app.asar",
+      "htmlMatch": "*.html",
+      "tested": true,
+      "notes": "Anthropic Claude Desktop. Installs per-version under app-<ver>\\; updates frequently, so re-run after each update."
+    },
+    {
+      "id": "vscode",
+      "name": "Visual Studio Code",
+      "type": "dir",
+      "bases": [
+        "%LOCALAPPDATA%\\Programs\\Microsoft VS Code",
+        "%PROGRAMFILES%\\Microsoft VS Code",
+        "%PROGRAMFILES(X86)%\\Microsoft VS Code"
+      ],
+      "target": "resources\\app",
+      "htmlMatch": "workbench*.html",
+      "tested": false,
+      "notes": "VS Code ships an unpacked resources\\app folder. Patches the workbench HTML directly. Re-run after VS Code updates."
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "type": "dir",
+      "bases": [
+        "%LOCALAPPDATA%\\Programs\\cursor",
+        "%LOCALAPPDATA%\\Programs\\Cursor"
+      ],
+      "target": "resources\\app",
+      "htmlMatch": "workbench*.html",
+      "tested": false,
+      "notes": "Cursor is VS Code-based; same unpacked layout. Re-run after updates."
+    },
+    {
+      "id": "chatgpt",
+      "name": "ChatGPT Desktop",
+      "type": "asar",
+      "bases": [
+        "%LOCALAPPDATA%\\Programs\\ChatGPT",
+        "%LOCALAPPDATA%\\Programs\\OpenAI",
+        "%LOCALAPPDATA%\\OpenAI\\ChatGPT"
+      ],
+      "target": "resources\\app.asar",
+      "htmlMatch": "*.html",
+      "tested": false,
+      "notes": "OpenAI ChatGPT desktop app. Path varies by installer; experimental."
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "type": "asar",
+      "bases": [
+        "%LOCALAPPDATA%\\slack"
+      ],
+      "target": "resources\\app.asar",
+      "htmlMatch": "*.html",
+      "tested": false,
+      "notes": "Slack installs per-version under app-<ver>\\. Experimental — Slack's renderer is heavily bundled."
+    },
+    {
+      "id": "discord",
+      "name": "Discord",
+      "type": "asar",
+      "bases": [
+        "%LOCALAPPDATA%\\Discord"
+      ],
+      "target": "resources\\app.asar",
+      "htmlMatch": "*.html",
+      "tested": false,
+      "notes": "EXPERIMENTAL + RISKY. Discord's app.asar is a thin loader and patching the client may conflict with its self-update and is discouraged by Discord. Use at your own risk."
+    }
+  ]
+}
