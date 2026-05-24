@@ -210,9 +210,11 @@ function Resolve-AppTarget($app) {
             $candidates += (Join-Path $_.FullName $app.target)
         }
         # Newest first so we patch the most recent installed version.
-        $hits = $candidates | Where-Object { Test-Path $_ } |
-                Sort-Object { (Get-Item $_).LastWriteTime } -Descending
-        if ($hits) { return $hits[0] }
+        # @() forces an array: a single match must NOT collapse to a [string],
+        # or $hits[0] would return its first character instead of the path.
+        $hits = @($candidates | Where-Object { Test-Path $_ } |
+                  Sort-Object { (Get-Item $_).LastWriteTime } -Descending)
+        if ($hits.Count -gt 0) { return $hits[0] }
     }
     return $null
 }
@@ -230,16 +232,28 @@ function New-Backup([string]$appId, [string]$sourcePath) {
 
 function Get-State {
     if (Test-Path $StateFile) {
-        try { return @(Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return @() }
+        try {
+            $raw = [System.IO.File]::ReadAllText($StateFile)
+            if (-not $raw.Trim()) { return @() }
+            # Keep only well-formed records (defends against any legacy/corrupt file).
+            return @($raw | ConvertFrom-Json | Where-Object { $null -ne $_.app })
+        } catch { return @() }
     }
     return @()
 }
 function Save-State($records) {
     if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
-    ,@($records) | ConvertTo-Json -Depth 6 | Set-Content -Path $StateFile -Encoding UTF8
+    $arr  = @($records)
+    $json = ConvertTo-Json -InputObject $arr -Depth 6
+    # PS 5.1 serializes a single-element array as a bare object; normalize to a JSON array.
+    if (-not $json.TrimStart().StartsWith('[')) { $json = "[$json]" }
+    [System.IO.File]::WriteAllText($StateFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup) {
-    $records = @(Get-State)
+    # Enumerate with foreach (NOT @(Get-State)): wrapping a function that returns
+    # an array in @() nests it, turning each existing record into a sub-array.
+    $records = @()
+    foreach ($e in (Get-State)) { $records += $e }
     $records += [pscustomobject]@{
         app    = $AppId
         target = $Target
@@ -292,10 +306,11 @@ function Get-InjectableHtml([string]$root, [string]$match) {
         Where-Object { Select-String -Path $_.FullName -Pattern '</head>|</body>|</html>' -Quiet -ErrorAction SilentlyContinue }
 }
 
-function Invoke-AsarAppPatch($app, [string]$asarPath) {
-    Step "  Backing up app.asar..."
-    $null = New-Backup -appId $app.id -sourcePath $asarPath
+function Test-AlreadyPatched([string]$htmlPath) {
+    ([System.IO.File]::ReadAllText($htmlPath)) -like "*id=""$Marker""*"
+}
 
+function Invoke-AsarAppPatch($app, [string]$asarPath) {
     $work = Join-Path $TmpRoot ($app.id + '_' + (Get-Date -Format 'HHmmss'))
     if (Test-Path $work) { Remove-Item $work -Recurse -Force }
     New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -304,13 +319,17 @@ function Invoke-AsarAppPatch($app, [string]$asarPath) {
     Invoke-Asar -Action 'extract' -A $asarPath -B $work
 
     $htmls = @(Get-InjectableHtml -root $work -match $app.htmlMatch)
-    if ($htmls.Count -eq 0) { throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
+    if ($htmls.Count -eq 0) { Remove-Item $work -Recurse -Force; throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
 
     $patched = 0
     foreach ($h in $htmls) {
         if (Add-Injection $h.FullName) { Info "    + injected into $($h.Name)"; $patched++ }
     }
     if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; Remove-Item $work -Recurse -Force; return }
+
+    # Back up the still-pristine original only now that we know we changed something.
+    Step "  Backing up app.asar..."
+    $null = New-Backup -appId $app.id -sourcePath $asarPath
 
     Step "  Repacking app.asar..."
     $newAsar = "$asarPath.new"
@@ -332,6 +351,7 @@ function Invoke-DirAppPatch($app, [string]$appDir) {
 
     $patched = 0
     foreach ($h in $htmls) {
+        if (Test-AlreadyPatched $h.FullName) { continue }   # don't back up an already-patched file
         $null = New-Backup -appId $app.id -sourcePath $h.FullName
         if (Add-Injection $h.FullName) { Info "    + injected into $($h.Name)"; $patched++ }
     }
@@ -354,8 +374,9 @@ function Invoke-AppPatch($app) {
 
 function Restore-App($app) {
     Step "==> Restoring $($app.name)"
-    $records = @(Get-State) | Where-Object { $_.app -eq $app.id }
-    if (-not $records) { Warn "  No backups recorded. Nothing to restore."; return }
+    $records = @()
+    foreach ($e in (Get-State)) { if ($e.app -eq $app.id) { $records += $e } }
+    if ($records.Count -eq 0) { Warn "  No backups recorded. Nothing to restore."; return }
     # Newest backup per target.
     $byTarget = $records | Group-Object target
     foreach ($g in $byTarget) {
