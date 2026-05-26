@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "comment": "Catalog of Electron apps the patcher knows how to locate on Windows. Add your own entries here — see README. 'type':'asar' apps ship a packed resources/app.asar (extract/inject/repack). 'type':'dir' apps ship an unpacked resources/app/ folder (inject in place).",
+  "comment": "Catalog of Electron apps the patcher knows how to locate on Windows. Add your own entries here - see README. 'type':'asar' apps ship a packed resources/app.asar (extract/inject/repack). 'type':'dir' apps ship an unpacked resources/app/ folder (inject in place). 'injectMode':'external' (optional, default 'inline') writes the JS payload to a sidecar file and references it via <script src> - required for apps with a strict CSP (e.g. VS Code) that blocks inline scripts.",
   "apps": [
     {
       "id": "claude",
@@ -13,6 +13,7 @@
       ],
       "target": "resources\\app.asar",
       "htmlMatch": "*.html",
+      "injectMode": "inline",
       "tested": true,
       "notes": "Anthropic Claude Desktop. Installs per-version under app-<ver>\\; updates frequently, so re-run after each update."
     },
@@ -27,8 +28,23 @@
       ],
       "target": "resources\\app",
       "htmlMatch": "workbench*.html",
+      "injectMode": "external",
       "tested": false,
-      "notes": "VS Code ships an unpacked resources\\app folder. Patches the workbench HTML directly. Re-run after VS Code updates."
+      "notes": "VS Code has a strict CSP (no 'unsafe-inline' for script-src), so we must inject as an external <script src> sidecar file. Re-run after VS Code updates."
+    },
+    {
+      "id": "vscode-insiders",
+      "name": "VS Code Insiders",
+      "type": "dir",
+      "bases": [
+        "%LOCALAPPDATA%\\Programs\\Microsoft VS Code Insiders",
+        "%PROGRAMFILES%\\Microsoft VS Code Insiders"
+      ],
+      "target": "resources\\app",
+      "htmlMatch": "workbench*.html",
+      "injectMode": "external",
+      "tested": false,
+      "notes": "VS Code Insiders. Versioned hash subfolders; patcher targets the newest. Insiders updates ~daily, overwriting the patch - re-run after updates."
     },
     {
       "id": "cursor",
@@ -40,8 +56,9 @@
       ],
       "target": "resources\\app",
       "htmlMatch": "workbench*.html",
+      "injectMode": "external",
       "tested": false,
-      "notes": "Cursor is VS Code-based; same unpacked layout. Re-run after updates."
+      "notes": "Cursor is VS Code-based; same unpacked layout and strict CSP. Re-run after updates."
     },
     {
       "id": "chatgpt",
@@ -54,6 +71,7 @@
       ],
       "target": "resources\\app.asar",
       "htmlMatch": "*.html",
+      "injectMode": "inline",
       "tested": false,
       "notes": "OpenAI ChatGPT desktop app. Path varies by installer; experimental."
     },
@@ -66,8 +84,9 @@
       ],
       "target": "resources\\app.asar",
       "htmlMatch": "*.html",
+      "injectMode": "inline",
       "tested": false,
-      "notes": "Slack installs per-version under app-<ver>\\. Experimental — Slack's renderer is heavily bundled."
+      "notes": "Slack installs per-version under app-<ver>\\. Experimental - Slack's renderer is heavily bundled."
     },
     {
       "id": "discord",
@@ -78,6 +97,7 @@
       ],
       "target": "resources\\app.asar",
       "htmlMatch": "*.html",
+      "injectMode": "inline",
       "tested": false,
       "notes": "EXPERIMENTAL + RISKY. Discord's app.asar is a thin loader and patching the client may conflict with its self-update and is discouraged by Discord. Use at your own risk."
     }

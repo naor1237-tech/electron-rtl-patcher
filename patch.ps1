@@ -220,13 +220,15 @@ function Resolve-AppTarget($app) {
 }
 
 function New-Backup([string]$appId, [string]$sourcePath) {
+    # Just makes the backup file and returns its path. State is recorded
+    # by the caller (after a successful injection), so we don't leave a
+    # state record pointing at a backup of a file we then failed to patch.
     $appBackupDir = Join-Path $BackupDir $appId
     if (-not (Test-Path $appBackupDir)) { New-Item -ItemType Directory -Path $appBackupDir -Force | Out-Null }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $name  = Split-Path $sourcePath -Leaf
     $dest  = Join-Path $appBackupDir ("{0}.{1}.bak" -f $name, $stamp)
     Copy-Item -LiteralPath $sourcePath -Destination $dest -Force
-    Add-StateRecord -AppId $appId -Target $sourcePath -Backup $dest
     return $dest
 }
 
@@ -249,37 +251,55 @@ function Save-State($records) {
     if (-not $json.TrimStart().StartsWith('[')) { $json = "[$json]" }
     [System.IO.File]::WriteAllText($StateFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
-function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup) {
+function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [string]$Sidecar = '') {
     # Enumerate with foreach (NOT @(Get-State)): wrapping a function that returns
     # an array in @() nests it, turning each existing record into a sub-array.
     $records = @()
     foreach ($e in (Get-State)) { $records += $e }
     $records += [pscustomobject]@{
-        app    = $AppId
-        target = $Target
-        backup = $Backup
-        time   = (Get-Date -Format 's')
+        app     = $AppId
+        target  = $Target
+        backup  = $Backup
+        sidecar = $Sidecar     # external-mode .js file to also remove on restore (empty = none)
+        time    = (Get-Date -Format 's')
     }
     Save-State $records
 }
 
 # Insert the <script> before </head> (or </body>, or append). Idempotent.
-function Add-Injection([string]$htmlPath) {
+#
+# Modes (from $app.injectMode, default 'inline'):
+#   inline   - <script id="...">JS</script>  (works when CSP allows 'unsafe-inline' or has none)
+#   external - writes a sidecar .js next to the html, references via <script src> with 'self' -
+#              required for apps like VS Code whose CSP forbids inline scripts.
+#
+# Returns $null if already patched. Otherwise returns a PSCustomObject:
+#   .Patched = $true   .Sidecar = '<path or empty string>'
+function Add-Injection([string]$htmlPath, $app) {
+    $mode    = if ($app -and $app.injectMode) { $app.injectMode } else { 'inline' }
     $content = [System.IO.File]::ReadAllText($htmlPath)
-    if ($content -like "*id=""$Marker""*") { return $false }   # already patched
-    $tag = "<script id=""$Marker"">`n$RtlPayloadJs`n</script>`n"
+    if ($content -like "*id=""$Marker""*") { return $null }   # already patched
+
+    $sidecar = ''
+    if ($mode -eq 'external') {
+        $sidecar = Join-Path (Split-Path $htmlPath) 'electron-rtl-patch.js'
+        [System.IO.File]::WriteAllText($sidecar, $RtlPayloadJs, (New-Object System.Text.UTF8Encoding($false)))
+        $tag = "<script id=""$Marker"" src=""./electron-rtl-patch.js""></script>`n"
+    } else {
+        $tag = "<script id=""$Marker"">`n$RtlPayloadJs`n</script>`n"
+    }
 
     foreach ($anchor in @('</head>', '</body>', '</html>')) {
         $idx = $content.IndexOf($anchor, [System.StringComparison]::OrdinalIgnoreCase)
         if ($idx -ge 0) {
             $content = $content.Substring(0, $idx) + $tag + $content.Substring($idx)
             [System.IO.File]::WriteAllText($htmlPath, $content, (New-Object System.Text.UTF8Encoding($false)))
-            return $true
+            return [pscustomobject]@{ Patched = $true; Sidecar = $sidecar }
         }
     }
     # No anchor - append.
     [System.IO.File]::WriteAllText($htmlPath, $content + "`n" + $tag, (New-Object System.Text.UTF8Encoding($false)))
-    return $true
+    return [pscustomobject]@{ Patched = $true; Sidecar = $sidecar }
 }
 
 function Get-Npx {
@@ -323,13 +343,14 @@ function Invoke-AsarAppPatch($app, [string]$asarPath) {
 
     $patched = 0
     foreach ($h in $htmls) {
-        if (Add-Injection $h.FullName) { Info "    + injected into $($h.Name)"; $patched++ }
+        $r = Add-Injection $h.FullName $app
+        if ($null -ne $r) { Info "    + injected into $($h.Name)"; $patched++ }
     }
     if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; Remove-Item $work -Recurse -Force; return }
 
     # Back up the still-pristine original only now that we know we changed something.
     Step "  Backing up app.asar..."
-    $null = New-Backup -appId $app.id -sourcePath $asarPath
+    $backup = New-Backup -appId $app.id -sourcePath $asarPath
 
     Step "  Repacking app.asar..."
     $newAsar = "$asarPath.new"
@@ -342,6 +363,9 @@ function Invoke-AsarAppPatch($app, [string]$asarPath) {
     }
     Move-Item -LiteralPath $newAsar -Destination $asarPath -Force
     Remove-Item $work -Recurse -Force
+    # Sidecar (if any) was packed inside the repacked asar; restoring the asar
+    # naturally reverts it, so no on-disk sidecar to track here.
+    Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup
     Good "  Done - $patched HTML file(s) patched in $($app.name)."
 }
 
@@ -352,8 +376,14 @@ function Invoke-DirAppPatch($app, [string]$appDir) {
     $patched = 0
     foreach ($h in $htmls) {
         if (Test-AlreadyPatched $h.FullName) { continue }   # don't back up an already-patched file
-        $null = New-Backup -appId $app.id -sourcePath $h.FullName
-        if (Add-Injection $h.FullName) { Info "    + injected into $($h.Name)"; $patched++ }
+        $backup = New-Backup -appId $app.id -sourcePath $h.FullName
+        $r = Add-Injection $h.FullName $app
+        if ($null -ne $r) {
+            Info "    + injected into $($h.Name)"
+            if ($r.Sidecar) { Info "      sidecar: $($r.Sidecar)" }
+            Add-StateRecord -AppId $app.id -Target $h.FullName -Backup $backup -Sidecar $r.Sidecar
+            $patched++
+        }
     }
     if ($patched -eq 0) { Warn "  (already patched - nothing to do)"; return }
     Good "  Done - $patched HTML file(s) patched in $($app.name)."
@@ -384,6 +414,11 @@ function Restore-App($app) {
         if (Test-Path $latest.backup) {
             Copy-Item -LiteralPath $latest.backup -Destination $latest.target -Force
             Good "  Restored $($latest.target)"
+            # Clean up the external-mode sidecar that's now orphaned.
+            if ($latest.sidecar -and (Test-Path $latest.sidecar)) {
+                Remove-Item -LiteralPath $latest.sidecar -Force -ErrorAction SilentlyContinue
+                Info "    + removed sidecar $($latest.sidecar)"
+            }
         } else {
             Warn "  Backup missing: $($latest.backup)"
         }
