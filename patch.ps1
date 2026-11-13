@@ -323,7 +323,12 @@ function Invoke-Asar([string]$Action, [string]$A, [string]$B) {
     if (-not $npx) {
         throw "npx (Node.js) not found in PATH. Install Node.js from https://nodejs.org and retry."
     }
-    & $npx --yes $AsarPackage $Action $A $B 2>&1 | ForEach-Object { Write-Log $_ 'ASAR' }
+    # Windows PowerShell 5.1 turns native stderr lines captured with 2>&1 into
+    # error records, and under 'Stop' the first one (npm prints "npm warn exec ..."
+    # when it has to download the package) would abort the run. Only the exit
+    # code decides success here.
+    $ErrorActionPreference = 'Continue'
+    & $npx --yes $AsarPackage $Action $A $B 2>&1 | ForEach-Object { Write-Log "$_" 'ASAR' }
     if ($LASTEXITCODE -ne 0) { throw "asar $Action failed (exit $LASTEXITCODE). See $LogFile." }
 }
 
