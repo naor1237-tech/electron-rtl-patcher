@@ -45,6 +45,7 @@ $ErrorActionPreference = 'Stop'
 $RepoRaw       = 'https://raw.githubusercontent.com/naor1237-tech/electron-rtl-patcher/main'  # placeholder until pushed
 $AsarPackage   = '@electron/asar@4.2.0'
 $Marker        = 'electron-rtl-patch'                       # idempotency / detection marker
+$SidecarName   = 'electron-rtl-patch.js'                    # external-mode payload file written next to the html
 $StateDir      = Join-Path $env:ProgramData 'ElectronRtlPatch'
 $BackupDir     = Join-Path $StateDir 'backups'
 $StateFile     = Join-Path $StateDir 'state.json'
@@ -197,6 +198,32 @@ function Get-AppCatalog {
     return ($json | ConvertFrom-Json).apps
 }
 
+# Returns $null for a usable catalog entry, otherwise the reason it is rejected.
+# The id becomes a folder name under the backup/temp dirs, and target/htmlMatch
+# are joined onto the install folder, so none of them may escape their parent.
+function Test-CatalogEntry($app) {
+    if ($null -eq $app) { return 'empty entry' }
+    if (-not ($app.id -is [string]) -or $app.id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        return "id must be letters, digits, '.', '_' or '-'"
+    }
+    if (-not ($app.name -is [string]) -or -not $app.name.Trim()) { return 'name is missing' }
+    if (@('asar', 'dir') -notcontains $app.type) { return "type must be 'asar' or 'dir'" }
+    $bases = @($app.bases | Where-Object { $_ -is [string] -and $_.Trim() })
+    if ($bases.Count -eq 0) { return 'bases is empty' }
+    if (-not ($app.target -is [string]) -or -not $app.target.Trim()) { return 'target is missing' }
+    if ($app.target -match '^[\\/]' -or $app.target -match ':' -or $app.target -match '(^|[\\/])\.\.([\\/]|$)') {
+        return "target must be a relative path without '..'"
+    }
+    if ($app.type -eq 'asar' -and $app.target -notlike '*.asar') { return "target of an 'asar' app must end with .asar" }
+    if (-not ($app.htmlMatch -is [string]) -or -not $app.htmlMatch.Trim() -or $app.htmlMatch -match '[\\/:]') {
+        return 'htmlMatch must be a file-name pattern (no folders)'
+    }
+    if ($app.injectMode -and (@('inline', 'external') -notcontains $app.injectMode)) {
+        return "injectMode must be 'inline' or 'external'"
+    }
+    return $null
+}
+
 # Resolve the on-disk target (asar file or app dir) for a catalog entry.
 function Resolve-AppTarget($app) {
     foreach ($base in $app.bases) {
@@ -228,6 +255,13 @@ function New-Backup([string]$appId, [string]$sourcePath) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $name  = Split-Path $sourcePath -Leaf
     $dest  = Join-Path $appBackupDir ("{0}.{1}.bak" -f $name, $stamp)
+    # Two files with the same leaf name (e.g. two index.html in different folders)
+    # backed up within the same second must not overwrite each other's backup.
+    $n = 1
+    while (Test-Path -LiteralPath $dest) {
+        $dest = Join-Path $appBackupDir ("{0}.{1}-{2}.bak" -f $name, $stamp, $n)
+        $n++
+    }
     Copy-Item -LiteralPath $sourcePath -Destination $dest -Force
     return $dest
 }
@@ -246,12 +280,12 @@ function Get-State {
 function Save-State($records) {
     if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
     $arr  = @($records)
-    $json = ConvertTo-Json -InputObject $arr -Depth 6
+    $json = if ($arr.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $arr -Depth 6 }
     # PS 5.1 serializes a single-element array as a bare object; normalize to a JSON array.
     if (-not $json.TrimStart().StartsWith('[')) { $json = "[$json]" }
     [System.IO.File]::WriteAllText($StateFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
-function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [string]$Sidecar = '') {
+function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [string]$Sidecar = '', [long]$PatchedSize = 0) {
     # Enumerate with foreach (NOT @(Get-State)): wrapping a function that returns
     # an array in @() nests it, turning each existing record into a sub-array.
     $records = @()
@@ -261,6 +295,7 @@ function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [stri
         target  = $Target
         backup  = $Backup
         sidecar = $Sidecar     # external-mode .js file to also remove on restore (empty = none)
+        patchedSize = $PatchedSize   # size of the patched asar; lets Restore notice an app update (0 = unknown)
         time    = (Get-Date -Format 's')
     }
     Save-State $records
@@ -282,9 +317,9 @@ function Add-Injection([string]$htmlPath, $app) {
 
     $sidecar = ''
     if ($mode -eq 'external') {
-        $sidecar = Join-Path (Split-Path $htmlPath) 'electron-rtl-patch.js'
+        $sidecar = Join-Path (Split-Path $htmlPath) $SidecarName
         [System.IO.File]::WriteAllText($sidecar, $RtlPayloadJs, (New-Object System.Text.UTF8Encoding($false)))
-        $tag = "<script id=""$Marker"" src=""./electron-rtl-patch.js""></script>`n"
+        $tag = "<script id=""$Marker"" src=""./$SidecarName""></script>`n"
     } else {
         $tag = "<script id=""$Marker"">`n$RtlPayloadJs`n</script>`n"
     }
@@ -314,7 +349,12 @@ function Invoke-Asar([string]$Action, [string]$A, [string]$B) {
     if (-not $npx) {
         throw "npx (Node.js) not found in PATH. Install Node.js from https://nodejs.org and retry."
     }
-    & $npx --yes $AsarPackage $Action $A $B 2>&1 | ForEach-Object { Write-Log $_ 'ASAR' }
+    # Windows PowerShell 5.1 turns native stderr lines captured with 2>&1 into
+    # error records, and under 'Stop' the first one (npm prints "npm warn exec ..."
+    # when it has to download the package) would abort the run. Only the exit
+    # code decides success here.
+    $ErrorActionPreference = 'Continue'
+    & $npx --yes $AsarPackage $Action $A $B 2>&1 | ForEach-Object { Write-Log "$_" 'ASAR' }
     if ($LASTEXITCODE -ne 0) { throw "asar $Action failed (exit $LASTEXITCODE). See $LogFile." }
 }
 
@@ -331,42 +371,47 @@ function Test-AlreadyPatched([string]$htmlPath) {
 }
 
 function Invoke-AsarAppPatch($app, [string]$asarPath) {
-    $work = Join-Path $TmpRoot ($app.id + '_' + (Get-Date -Format 'HHmmss'))
+    $work    = Join-Path $TmpRoot ($app.id + '_' + (Get-Date -Format 'HHmmss'))
+    $newAsar = "$asarPath.new"
     if (Test-Path $work) { Remove-Item $work -Recurse -Force }
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-    Step "  Extracting app.asar..."
-    Invoke-Asar -Action 'extract' -A $asarPath -B $work
+    # try/finally: whatever happens (asar failure, locked file because the app is
+    # running, ...) never leave the temp extraction or a stray app.asar.new behind.
+    try {
+        Step "  Extracting app.asar..."
+        Invoke-Asar -Action 'extract' -A $asarPath -B $work
 
-    $htmls = @(Get-InjectableHtml -root $work -match $app.htmlMatch)
-    if ($htmls.Count -eq 0) { Remove-Item $work -Recurse -Force; throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
+        $htmls = @(Get-InjectableHtml -root $work -match $app.htmlMatch)
+        if ($htmls.Count -eq 0) { throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
 
-    $patched = 0
-    foreach ($h in $htmls) {
-        $r = Add-Injection $h.FullName $app
-        if ($null -ne $r) { Info "    + injected into $($h.Name)"; $patched++ }
+        $patched = 0
+        foreach ($h in $htmls) {
+            $r = Add-Injection $h.FullName $app
+            if ($null -ne $r) { Info "    + injected into $($h.Name)"; $patched++ }
+        }
+        if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; return }
+
+        # Back up the still-pristine original only now that we know we changed something.
+        Step "  Backing up app.asar..."
+        $backup = New-Backup -appId $app.id -sourcePath $asarPath
+
+        Step "  Repacking app.asar..."
+        if (Test-Path $newAsar) { Remove-Item $newAsar -Force }
+        Invoke-Asar -Action 'pack' -A $work -B $newAsar
+
+        if (-not (Test-Path $newAsar) -or (Get-Item $newAsar).Length -lt 1024) {
+            throw "Repacked asar looks invalid (too small). Original left untouched."
+        }
+        Move-Item -LiteralPath $newAsar -Destination $asarPath -Force
+        # Sidecar (if any) was packed inside the repacked asar; restoring the asar
+        # naturally reverts it, so no on-disk sidecar to track here.
+        Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup -PatchedSize (Get-Item -LiteralPath $asarPath).Length
+        Good "  Done - $patched HTML file(s) patched in $($app.name)."
+    } finally {
+        Remove-Item -LiteralPath $work    -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $newAsar -Force          -ErrorAction SilentlyContinue
     }
-    if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; Remove-Item $work -Recurse -Force; return }
-
-    # Back up the still-pristine original only now that we know we changed something.
-    Step "  Backing up app.asar..."
-    $backup = New-Backup -appId $app.id -sourcePath $asarPath
-
-    Step "  Repacking app.asar..."
-    $newAsar = "$asarPath.new"
-    if (Test-Path $newAsar) { Remove-Item $newAsar -Force }
-    Invoke-Asar -Action 'pack' -A $work -B $newAsar
-
-    if (-not (Test-Path $newAsar) -or (Get-Item $newAsar).Length -lt 1024) {
-        Remove-Item $newAsar -Force -ErrorAction SilentlyContinue
-        throw "Repacked asar looks invalid (too small). Original left untouched."
-    }
-    Move-Item -LiteralPath $newAsar -Destination $asarPath -Force
-    Remove-Item $work -Recurse -Force
-    # Sidecar (if any) was packed inside the repacked asar; restoring the asar
-    # naturally reverts it, so no on-disk sidecar to track here.
-    Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup
-    Good "  Done - $patched HTML file(s) patched in $($app.name)."
 }
 
 function Invoke-DirAppPatch($app, [string]$appDir) {
@@ -402,26 +447,77 @@ function Invoke-AppPatch($app) {
     }
 }
 
+# True when $path resolves to a location inside $dir ('..' segments are normalized first).
+function Test-UnderDir([string]$path, [string]$dir) {
+    if (-not $path -or -not $dir) { return $false }
+    try {
+        $full = [System.IO.Path]::GetFullPath($path)
+        $root = [System.IO.Path]::GetFullPath($dir).TrimEnd([char[]]'\/') + [System.IO.Path]::DirectorySeparatorChar
+        return $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
 function Restore-App($app) {
     Step "==> Restoring $($app.name)"
-    $records = @()
-    foreach ($e in (Get-State)) { if ($e.app -eq $app.id) { $records += $e } }
+    $all = @()
+    foreach ($e in (Get-State)) { $all += $e }
+    $records = @($all | Where-Object { $_.app -eq $app.id })
     if ($records.Count -eq 0) { Warn "  No backups recorded. Nothing to restore."; return }
+    # Targets whose records are finished with (restored, or stale after an app
+    # update). They are dropped from state so a later Restore can never copy an
+    # old backup over a newer version of the app.
+    $done = @()
     # Newest backup per target.
-    $byTarget = $records | Group-Object target
-    foreach ($g in $byTarget) {
+    foreach ($g in ($records | Group-Object target)) {
         $latest = $g.Group | Sort-Object time -Descending | Select-Object -First 1
-        if (Test-Path $latest.backup) {
-            Copy-Item -LiteralPath $latest.backup -Destination $latest.target -Force
-            Good "  Restored $($latest.target)"
-            # Clean up the external-mode sidecar that's now orphaned.
-            if ($latest.sidecar -and (Test-Path $latest.sidecar)) {
+        $t = [string]$latest.target
+        try {
+            # state.json is plain user-writable data: only ever copy from our own backup folder.
+            if (-not (Test-UnderDir $latest.backup $BackupDir)) {
+                Warn "  Skipped $t - recorded backup is not inside $BackupDir."
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $latest.backup)) {
+                Warn "  Backup missing: $($latest.backup)"
+                continue
+            }
+            $parent = Split-Path -Parent $t
+            if (-not $parent -or -not (Test-Path -LiteralPath $parent)) {
+                Warn "  Skipped $t - its folder no longer exists (app updated or uninstalled)."
+                $done += $t
+                continue
+            }
+            if (Test-Path -LiteralPath $t) {
+                # Did the app replace the file since we patched it? Then our backup
+                # belongs to an older version and must not be copied over it.
+                $stale = $false
+                if ($t -like '*.asar') {
+                    if ($latest.patchedSize -and ([long]$latest.patchedSize -ne (Get-Item -LiteralPath $t).Length)) { $stale = $true }
+                } elseif (-not (Test-AlreadyPatched $t)) {
+                    $stale = $true
+                }
+                if ($stale) {
+                    Warn "  Skipped $t - it is no longer the patched file (app updated, or already restored). Nothing to undo."
+                    $done += $t
+                    continue
+                }
+            }
+            Copy-Item -LiteralPath $latest.backup -Destination $t -Force
+            Good "  Restored $t"
+            $done += $t
+            # Clean up the external-mode sidecar that's now orphaned. Only a file
+            # with our own sidecar name is ever deleted.
+            if ($latest.sidecar -and ((Split-Path $latest.sidecar -Leaf) -eq $SidecarName) -and (Test-Path -LiteralPath $latest.sidecar)) {
                 Remove-Item -LiteralPath $latest.sidecar -Force -ErrorAction SilentlyContinue
                 Info "    + removed sidecar $($latest.sidecar)"
             }
-        } else {
-            Warn "  Backup missing: $($latest.backup)"
+        } catch {
+            Err "  Restore failed for ${t}: $($_.Exception.Message)"
         }
+    }
+    if ($done.Count -gt 0) {
+        $keep = @($all | Where-Object { -not (($_.app -eq $app.id) -and ($done -contains $_.target)) })
+        Save-State $keep
     }
 }
 
@@ -470,12 +566,24 @@ function Show-Menu($apps) {
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-$apps = @(Get-AppCatalog)
-if (-not $apps -or $apps.Count -eq 0) { Err "No app catalog available."; return }
+$apps = @()
+$seenIds = @{}
+foreach ($entry in (Get-AppCatalog)) {
+    $why = Test-CatalogEntry $entry
+    if (-not $why -and $seenIds.ContainsKey($entry.id.ToLowerInvariant())) { $why = 'duplicate id' }
+    if ($why) {
+        Warn "Ignoring catalog entry '$($entry.id)': $why."
+        continue
+    }
+    $seenIds[$entry.id.ToLowerInvariant()] = $true
+    $apps += $entry
+}
+if ($apps.Count -eq 0) { Err "No app catalog available."; return }
 
 # --- Non-interactive paths ---
 if ($Restore) {
     $targets = if ($AppId) { @($apps | Where-Object { $_.id -eq $AppId }) } else { $apps }
+    if ($AppId -and $targets.Count -eq 0) { Err "Unknown app id '$AppId'."; return }
     foreach ($a in $targets) { Restore-App $a }
     return
 }

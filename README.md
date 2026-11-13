@@ -19,7 +19,7 @@ One patcher, many apps — Claude Desktop, VS Code, Cursor, ChatGPT, Slack and m
 ### למה זה בטוח
 - **גיבוי לפני כל שינוי** — כל קובץ שמשתנה נשמר ב-`%ProgramData%\ElectronRtlPatch\backups\`, ויש שחזור מלא.
 - **אידמפוטנטי** — הרצה חוזרת לא מזריקה פעמיים (יש marker).
-- **רק שני יעדי רשת**: GitHub (להורדה) ונקודת הקצה הרשמית של כל אפליקציה. אין טלמטריה, אין איסוף מידע.
+- **רק שני יעדי רשת**: GitHub (הורדת הכלי והקטלוג) ו-npm (‏`npx` מוריד את `@electron/asar` בפעם הראשונה, רק לאפליקציות מסוג asar). הקוד שמוזרק לאפליקציה לא פונה לרשת. אין טלמטריה, אין איסוף מידע.
 - **קוד פתוח, ASCII בלבד בליבת ה-JS** — קל לקרוא ולבדוק.
 
 ### התקנה
@@ -50,6 +50,8 @@ irm https://raw.githubusercontent.com/naor1237-tech/electron-rtl-patcher/main/in
 ```
 או דרך התפריט: `R`.
 
+אם האפליקציה התעדכנה מאז התיקון, השחזור מדלג עליה (אין מה לבטל) ולא מעתיק גיבוי ישן מעל הגרסה החדשה.
+
 ### חשוב לדעת
 כל עדכון של האפליקציה **דורס** את הפאטצ' (העדכון מחליף את `app.asar`). פשוט מריצים את הכלי שוב אחרי עדכון.
 
@@ -63,7 +65,7 @@ Most desktop apps built on Electron don't handle Hebrew/Arabic correctly — tex
 ### Why it's safe
 - **Backs up before every change** to `%ProgramData%\ElectronRtlPatch\backups\`, with full restore.
 - **Idempotent** — re-running won't double-inject (marker check).
-- **Only two network destinations**: GitHub (to download) and each app's own origin. No telemetry.
+- **Only two network destinations**: GitHub (to download the tool and catalog) and the npm registry (`npx` fetches `@electron/asar` on first use, asar-type apps only). The injected script itself makes no network requests. No telemetry.
 - **Open source, ASCII-only JS core** — easy to read and audit.
 
 ### Install
@@ -100,6 +102,7 @@ Fully restart the app after patching.
 |-----------|------------------|------|--------|
 | `claude`  | Claude Desktop   | asar | yes    |
 | `vscode`  | Visual Studio Code | dir | no (experimental) |
+| `vscode-insiders` | VS Code Insiders | dir | no (experimental) |
 | `cursor`  | Cursor           | dir  | no (experimental) |
 | `chatgpt` | ChatGPT Desktop  | asar | no (experimental) |
 | `slack`   | Slack            | asar | no (experimental) |
@@ -118,19 +121,29 @@ Append an entry to `apps.json`:
   "bases": ["%LOCALAPPDATA%\\MyApp"],
   "target": "resources\\app.asar",
   "htmlMatch": "*.html",
+  "injectMode": "inline",
   "tested": false,
   "notes": "..."
 }
 ```
 - `bases` — folders to search (env vars expanded). Per-version `app-<ver>\` subfolders are handled automatically.
 - `target` — relative path to the `.asar` (type `asar`) or the app dir (type `dir`).
-- `htmlMatch` — which HTML files inside to inject into (e.g. `workbench*.html` for VS Code-based apps).
+- `id` — letters, digits, `.`, `_`, `-` only; must be unique.
+- `target` — must stay inside the base folder (no absolute path, no `..`).
+- `htmlMatch` — which HTML files inside to inject into (e.g. `workbench*.html` for VS Code-based apps). A file-name pattern, not a path.
+- `injectMode` — optional. `inline` (default) puts the script inside the HTML; `external` writes `electron-rtl-patch.js` next to the HTML and loads it with `<script src>`, needed for apps whose CSP blocks inline scripts (VS Code, Cursor).
+
+Malformed or duplicate entries are skipped with a warning.
 
 ## How it works
 1. Locate the app's `app.asar` / app dir from the catalog.
-2. Back up the original.
-3. (asar) extract with `@electron/asar` → (both) inject `<script id="electron-rtl-patch">…</script>` before `</head>` of the renderer HTML → (asar) repack.
-4. Validate the repacked archive, then atomically replace the original.
+2. (asar) extract a copy with `@electron/asar` → (both) back up the original, then inject `<script id="electron-rtl-patch">…</script>` before `</head>` of the renderer HTML → (asar) repack into `app.asar.new`.
+3. (asar) Check the repacked archive, then replace the original with it. If any step fails, the original is left as it was and temporary files are removed.
+
+`-Restore` copies the backup back only if the file is still the patched one; after an app update it skips and reports instead of overwriting the new version.
+
+## Tests
+`node --test tests/*.test.js` checks `apps.json` and runs the injected script against a fake DOM. The PowerShell flow itself has no automated tests; try changes against a throwaway folder, never a real install.
 
 The injected script: adds `unicode-bidi: plaintext; text-align: start` to text containers, forces `pre`/`code` to LTR, and stamps `dir="auto"` on RTL-bearing blocks via a throttled `MutationObserver`.
 
