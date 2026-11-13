@@ -45,6 +45,7 @@ $ErrorActionPreference = 'Stop'
 $RepoRaw       = 'https://raw.githubusercontent.com/naor1237-tech/electron-rtl-patcher/main'  # placeholder until pushed
 $AsarPackage   = '@electron/asar@4.2.0'
 $Marker        = 'electron-rtl-patch'                       # idempotency / detection marker
+$SidecarName   = 'electron-rtl-patch.js'                    # external-mode payload file written next to the html
 $StateDir      = Join-Path $env:ProgramData 'ElectronRtlPatch'
 $BackupDir     = Join-Path $StateDir 'backups'
 $StateFile     = Join-Path $StateDir 'state.json'
@@ -253,12 +254,12 @@ function Get-State {
 function Save-State($records) {
     if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
     $arr  = @($records)
-    $json = ConvertTo-Json -InputObject $arr -Depth 6
+    $json = if ($arr.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $arr -Depth 6 }
     # PS 5.1 serializes a single-element array as a bare object; normalize to a JSON array.
     if (-not $json.TrimStart().StartsWith('[')) { $json = "[$json]" }
     [System.IO.File]::WriteAllText($StateFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
-function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [string]$Sidecar = '') {
+function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [string]$Sidecar = '', [long]$PatchedSize = 0) {
     # Enumerate with foreach (NOT @(Get-State)): wrapping a function that returns
     # an array in @() nests it, turning each existing record into a sub-array.
     $records = @()
@@ -268,6 +269,7 @@ function Add-StateRecord([string]$AppId, [string]$Target, [string]$Backup, [stri
         target  = $Target
         backup  = $Backup
         sidecar = $Sidecar     # external-mode .js file to also remove on restore (empty = none)
+        patchedSize = $PatchedSize   # size of the patched asar; lets Restore notice an app update (0 = unknown)
         time    = (Get-Date -Format 's')
     }
     Save-State $records
@@ -289,9 +291,9 @@ function Add-Injection([string]$htmlPath, $app) {
 
     $sidecar = ''
     if ($mode -eq 'external') {
-        $sidecar = Join-Path (Split-Path $htmlPath) 'electron-rtl-patch.js'
+        $sidecar = Join-Path (Split-Path $htmlPath) $SidecarName
         [System.IO.File]::WriteAllText($sidecar, $RtlPayloadJs, (New-Object System.Text.UTF8Encoding($false)))
-        $tag = "<script id=""$Marker"" src=""./electron-rtl-patch.js""></script>`n"
+        $tag = "<script id=""$Marker"" src=""./$SidecarName""></script>`n"
     } else {
         $tag = "<script id=""$Marker"">`n$RtlPayloadJs`n</script>`n"
     }
@@ -372,7 +374,7 @@ function Invoke-AsarAppPatch($app, [string]$asarPath) {
     Remove-Item $work -Recurse -Force
     # Sidecar (if any) was packed inside the repacked asar; restoring the asar
     # naturally reverts it, so no on-disk sidecar to track here.
-    Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup
+    Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup -PatchedSize (Get-Item -LiteralPath $asarPath).Length
     Good "  Done - $patched HTML file(s) patched in $($app.name)."
 }
 
@@ -409,26 +411,77 @@ function Invoke-AppPatch($app) {
     }
 }
 
+# True when $path resolves to a location inside $dir ('..' segments are normalized first).
+function Test-UnderDir([string]$path, [string]$dir) {
+    if (-not $path -or -not $dir) { return $false }
+    try {
+        $full = [System.IO.Path]::GetFullPath($path)
+        $root = [System.IO.Path]::GetFullPath($dir).TrimEnd([char[]]'\/') + [System.IO.Path]::DirectorySeparatorChar
+        return $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
 function Restore-App($app) {
     Step "==> Restoring $($app.name)"
-    $records = @()
-    foreach ($e in (Get-State)) { if ($e.app -eq $app.id) { $records += $e } }
+    $all = @()
+    foreach ($e in (Get-State)) { $all += $e }
+    $records = @($all | Where-Object { $_.app -eq $app.id })
     if ($records.Count -eq 0) { Warn "  No backups recorded. Nothing to restore."; return }
+    # Targets whose records are finished with (restored, or stale after an app
+    # update). They are dropped from state so a later Restore can never copy an
+    # old backup over a newer version of the app.
+    $done = @()
     # Newest backup per target.
-    $byTarget = $records | Group-Object target
-    foreach ($g in $byTarget) {
+    foreach ($g in ($records | Group-Object target)) {
         $latest = $g.Group | Sort-Object time -Descending | Select-Object -First 1
-        if (Test-Path $latest.backup) {
-            Copy-Item -LiteralPath $latest.backup -Destination $latest.target -Force
-            Good "  Restored $($latest.target)"
-            # Clean up the external-mode sidecar that's now orphaned.
-            if ($latest.sidecar -and (Test-Path $latest.sidecar)) {
+        $t = [string]$latest.target
+        try {
+            # state.json is plain user-writable data: only ever copy from our own backup folder.
+            if (-not (Test-UnderDir $latest.backup $BackupDir)) {
+                Warn "  Skipped $t - recorded backup is not inside $BackupDir."
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $latest.backup)) {
+                Warn "  Backup missing: $($latest.backup)"
+                continue
+            }
+            $parent = Split-Path -Parent $t
+            if (-not $parent -or -not (Test-Path -LiteralPath $parent)) {
+                Warn "  Skipped $t - its folder no longer exists (app updated or uninstalled)."
+                $done += $t
+                continue
+            }
+            if (Test-Path -LiteralPath $t) {
+                # Did the app replace the file since we patched it? Then our backup
+                # belongs to an older version and must not be copied over it.
+                $stale = $false
+                if ($t -like '*.asar') {
+                    if ($latest.patchedSize -and ([long]$latest.patchedSize -ne (Get-Item -LiteralPath $t).Length)) { $stale = $true }
+                } elseif (-not (Test-AlreadyPatched $t)) {
+                    $stale = $true
+                }
+                if ($stale) {
+                    Warn "  Skipped $t - it is no longer the patched file (app updated, or already restored). Nothing to undo."
+                    $done += $t
+                    continue
+                }
+            }
+            Copy-Item -LiteralPath $latest.backup -Destination $t -Force
+            Good "  Restored $t"
+            $done += $t
+            # Clean up the external-mode sidecar that's now orphaned. Only a file
+            # with our own sidecar name is ever deleted.
+            if ($latest.sidecar -and ((Split-Path $latest.sidecar -Leaf) -eq $SidecarName) -and (Test-Path -LiteralPath $latest.sidecar)) {
                 Remove-Item -LiteralPath $latest.sidecar -Force -ErrorAction SilentlyContinue
                 Info "    + removed sidecar $($latest.sidecar)"
             }
-        } else {
-            Warn "  Backup missing: $($latest.backup)"
+        } catch {
+            Err "  Restore failed for ${t}: $($_.Exception.Message)"
         }
+    }
+    if ($done.Count -gt 0) {
+        $keep = @($all | Where-Object { -not (($_.app -eq $app.id) -and ($done -contains $_.target)) })
+        Save-State $keep
     }
 }
 
