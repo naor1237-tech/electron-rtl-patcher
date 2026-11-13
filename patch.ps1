@@ -198,6 +198,32 @@ function Get-AppCatalog {
     return ($json | ConvertFrom-Json).apps
 }
 
+# Returns $null for a usable catalog entry, otherwise the reason it is rejected.
+# The id becomes a folder name under the backup/temp dirs, and target/htmlMatch
+# are joined onto the install folder, so none of them may escape their parent.
+function Test-CatalogEntry($app) {
+    if ($null -eq $app) { return 'empty entry' }
+    if (-not ($app.id -is [string]) -or $app.id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        return "id must be letters, digits, '.', '_' or '-'"
+    }
+    if (-not ($app.name -is [string]) -or -not $app.name.Trim()) { return 'name is missing' }
+    if (@('asar', 'dir') -notcontains $app.type) { return "type must be 'asar' or 'dir'" }
+    $bases = @($app.bases | Where-Object { $_ -is [string] -and $_.Trim() })
+    if ($bases.Count -eq 0) { return 'bases is empty' }
+    if (-not ($app.target -is [string]) -or -not $app.target.Trim()) { return 'target is missing' }
+    if ($app.target -match '^[\\/]' -or $app.target -match ':' -or $app.target -match '(^|[\\/])\.\.([\\/]|$)') {
+        return "target must be a relative path without '..'"
+    }
+    if ($app.type -eq 'asar' -and $app.target -notlike '*.asar') { return "target of an 'asar' app must end with .asar" }
+    if (-not ($app.htmlMatch -is [string]) -or -not $app.htmlMatch.Trim() -or $app.htmlMatch -match '[\\/:]') {
+        return 'htmlMatch must be a file-name pattern (no folders)'
+    }
+    if ($app.injectMode -and (@('inline', 'external') -notcontains $app.injectMode)) {
+        return "injectMode must be 'inline' or 'external'"
+    }
+    return $null
+}
+
 # Resolve the on-disk target (asar file or app dir) for a catalog entry.
 function Resolve-AppTarget($app) {
     foreach ($base in $app.bases) {
@@ -540,12 +566,24 @@ function Show-Menu($apps) {
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-$apps = @(Get-AppCatalog)
-if (-not $apps -or $apps.Count -eq 0) { Err "No app catalog available."; return }
+$apps = @()
+$seenIds = @{}
+foreach ($entry in (Get-AppCatalog)) {
+    $why = Test-CatalogEntry $entry
+    if (-not $why -and $seenIds.ContainsKey($entry.id.ToLowerInvariant())) { $why = 'duplicate id' }
+    if ($why) {
+        Warn "Ignoring catalog entry '$($entry.id)': $why."
+        continue
+    }
+    $seenIds[$entry.id.ToLowerInvariant()] = $true
+    $apps += $entry
+}
+if ($apps.Count -eq 0) { Err "No app catalog available."; return }
 
 # --- Non-interactive paths ---
 if ($Restore) {
     $targets = if ($AppId) { @($apps | Where-Object { $_.id -eq $AppId }) } else { $apps }
+    if ($AppId -and $targets.Count -eq 0) { Err "Unknown app id '$AppId'."; return }
     foreach ($a in $targets) { Restore-App $a }
     return
 }
