@@ -228,6 +228,13 @@ function New-Backup([string]$appId, [string]$sourcePath) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $name  = Split-Path $sourcePath -Leaf
     $dest  = Join-Path $appBackupDir ("{0}.{1}.bak" -f $name, $stamp)
+    # Two files with the same leaf name (e.g. two index.html in different folders)
+    # backed up within the same second must not overwrite each other's backup.
+    $n = 1
+    while (Test-Path -LiteralPath $dest) {
+        $dest = Join-Path $appBackupDir ("{0}.{1}-{2}.bak" -f $name, $stamp, $n)
+        $n++
+    }
     Copy-Item -LiteralPath $sourcePath -Destination $dest -Force
     return $dest
 }
