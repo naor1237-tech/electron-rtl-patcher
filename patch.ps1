@@ -340,42 +340,47 @@ function Test-AlreadyPatched([string]$htmlPath) {
 }
 
 function Invoke-AsarAppPatch($app, [string]$asarPath) {
-    $work = Join-Path $TmpRoot ($app.id + '_' + (Get-Date -Format 'HHmmss'))
+    $work    = Join-Path $TmpRoot ($app.id + '_' + (Get-Date -Format 'HHmmss'))
+    $newAsar = "$asarPath.new"
     if (Test-Path $work) { Remove-Item $work -Recurse -Force }
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-    Step "  Extracting app.asar..."
-    Invoke-Asar -Action 'extract' -A $asarPath -B $work
+    # try/finally: whatever happens (asar failure, locked file because the app is
+    # running, ...) never leave the temp extraction or a stray app.asar.new behind.
+    try {
+        Step "  Extracting app.asar..."
+        Invoke-Asar -Action 'extract' -A $asarPath -B $work
 
-    $htmls = @(Get-InjectableHtml -root $work -match $app.htmlMatch)
-    if ($htmls.Count -eq 0) { Remove-Item $work -Recurse -Force; throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
+        $htmls = @(Get-InjectableHtml -root $work -match $app.htmlMatch)
+        if ($htmls.Count -eq 0) { throw "No injectable HTML (matching '$($app.htmlMatch)') found inside the asar." }
 
-    $patched = 0
-    foreach ($h in $htmls) {
-        $r = Add-Injection $h.FullName $app
-        if ($null -ne $r) { Info "    + injected into $($h.Name)"; $patched++ }
+        $patched = 0
+        foreach ($h in $htmls) {
+            $r = Add-Injection $h.FullName $app
+            if ($null -ne $r) { Info "    + injected into $($h.Name)"; $patched++ }
+        }
+        if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; return }
+
+        # Back up the still-pristine original only now that we know we changed something.
+        Step "  Backing up app.asar..."
+        $backup = New-Backup -appId $app.id -sourcePath $asarPath
+
+        Step "  Repacking app.asar..."
+        if (Test-Path $newAsar) { Remove-Item $newAsar -Force }
+        Invoke-Asar -Action 'pack' -A $work -B $newAsar
+
+        if (-not (Test-Path $newAsar) -or (Get-Item $newAsar).Length -lt 1024) {
+            throw "Repacked asar looks invalid (too small). Original left untouched."
+        }
+        Move-Item -LiteralPath $newAsar -Destination $asarPath -Force
+        # Sidecar (if any) was packed inside the repacked asar; restoring the asar
+        # naturally reverts it, so no on-disk sidecar to track here.
+        Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup -PatchedSize (Get-Item -LiteralPath $asarPath).Length
+        Good "  Done - $patched HTML file(s) patched in $($app.name)."
+    } finally {
+        Remove-Item -LiteralPath $work    -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $newAsar -Force          -ErrorAction SilentlyContinue
     }
-    if ($patched -eq 0) { Warn "    (already patched - nothing to do)"; Remove-Item $work -Recurse -Force; return }
-
-    # Back up the still-pristine original only now that we know we changed something.
-    Step "  Backing up app.asar..."
-    $backup = New-Backup -appId $app.id -sourcePath $asarPath
-
-    Step "  Repacking app.asar..."
-    $newAsar = "$asarPath.new"
-    if (Test-Path $newAsar) { Remove-Item $newAsar -Force }
-    Invoke-Asar -Action 'pack' -A $work -B $newAsar
-
-    if (-not (Test-Path $newAsar) -or (Get-Item $newAsar).Length -lt 1024) {
-        Remove-Item $newAsar -Force -ErrorAction SilentlyContinue
-        throw "Repacked asar looks invalid (too small). Original left untouched."
-    }
-    Move-Item -LiteralPath $newAsar -Destination $asarPath -Force
-    Remove-Item $work -Recurse -Force
-    # Sidecar (if any) was packed inside the repacked asar; restoring the asar
-    # naturally reverts it, so no on-disk sidecar to track here.
-    Add-StateRecord -AppId $app.id -Target $asarPath -Backup $backup -PatchedSize (Get-Item -LiteralPath $asarPath).Length
-    Good "  Done - $patched HTML file(s) patched in $($app.name)."
 }
 
 function Invoke-DirAppPatch($app, [string]$appDir) {
