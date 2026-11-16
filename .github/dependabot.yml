@@ -1,0 +1,9 @@
+# עדכוני תלויות אוטומטיים מגיטהאב (Dependabot): לכל היותר PR אחד בשבוע לכל סוג, ביום ראשון בבוקר.
+# עדכוני patch/minor מקובצים ל-PR אחד; major נפתח לבד כי הוא עלול לשבור. שום דבר לא ממוזג בלי אישור.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: sunday, time: "07:00", timezone: Asia/Jerusalem }
+    groups:
+      actions: { patterns: ["*"] }
