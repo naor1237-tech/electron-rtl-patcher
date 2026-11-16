@@ -1,0 +1,59 @@
+# בדיקות על כל שינוי:
+#  - בדיקות ה-payload (node --test): שכבת ה-RTL שמוזרקת לאפליקציות, מול DOM מדומה.
+#  - PSScriptAnalyzer (PowerShell/PSScriptAnalyzer, הלינטר הרשמי של מיקרוסופט) + בדיקת
+#    תחביר של patch.ps1 ו-install.ps1, על Windows (כמו אצל המשתמשים) ועל PowerShell 7.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  payload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: node --test tests/*.test.js
+      - name: apps.json is valid JSON
+        run: node -e 'JSON.parse(require("fs").readFileSync("apps.json","utf8"))'
+
+  powershell:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Syntax (Windows PowerShell 5.1, what most users run)
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Filter *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            foreach ($e in $errs) { Write-Host "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
+      - name: PSScriptAnalyzer (errors fail, warnings are listed)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $all = Invoke-ScriptAnalyzer -Path . -Recurse
+          $all | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message | Out-String -Width 220 | Write-Host
+          $errors = @($all | Where-Object Severity -eq 'Error')
+          foreach ($e in $errors) { Write-Host "::error file=$($e.ScriptName),line=$($e.Line)::$($e.RuleName): $($e.Message)" }
+          if ($errors.Count) { exit 1 }
