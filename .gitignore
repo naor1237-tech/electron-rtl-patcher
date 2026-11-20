@@ -12,3 +12,6 @@ desktop.ini
 # Editor
 .vscode/
 .idea/
+
+# graphify: גרף הקוד נבנה מקומית (graphify update .)
+graphify-out/
